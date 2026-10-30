@@ -1,0 +1,18 @@
+{
+	"luci-app-bestip": {
+		"description": "Grant access to Best IP",
+		"read": {
+			"ubus": {
+				"bestip": [ "status", "history" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "bestip" ]
+		},
+		"write": {
+			"ubus": {
+				"bestip": [ "run", "setup", "unsetup" ]
+			},
+			"uci": [ "bestip" ]
+		}
+	}
+}

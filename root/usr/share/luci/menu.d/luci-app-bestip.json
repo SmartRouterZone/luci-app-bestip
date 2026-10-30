@@ -1,0 +1,24 @@
+{
+	"admin/services/bestip": {
+		"title": "优选 IP",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "bestip/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-bestip" ]
+		}
+	},
+	"admin/services/bestip/settings": {
+		"title": "设置",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "bestip/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-bestip" ]
+		}
+	}
+}
