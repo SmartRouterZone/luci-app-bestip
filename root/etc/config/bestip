@@ -8,10 +8,11 @@ config bestip 'main'
 	option target 'https://dash.cloudflare.com/favicon.ico'
 
 	# 结果写入：每行一个 IP，同名两条
-	option hostname 'best.local'
-	# 放 /etc 而不是 /tmp：重启后 dnsmasq 启动时文件还在，不会报错也不会断解析
-	option hosts_file '/etc/best.hosts'
-	option state_dir '/tmp/bestip'
+	option hostname 'best.host'
+	# 多条线路可共用一个文件，各自只替换自己 hostname 的行
+	option hosts_file '/tmp/bestip.host'
+	# 留空则用 /tmp/bestip/<解析域名>
+	# option state_dir '/tmp/bestip/best.host'
 
 	# 优选 IP 池（暂只支持 /24 或单个 IP）
 	list pool '172.64.229.0/24'
@@ -28,10 +29,13 @@ config bestip 'main'
 	option connect_timeout '3'
 	option max_time '5'
 
-	# 判决：失败几次淘汰、延迟上限、波动上限（最慢一次 / 中位数，200 = 2 倍）
+	# 判决：失败几次淘汰、延迟上限、波动上限（ping:443 最慢一次 / 中位数，200 = 2 倍）
 	option max_fails '1'
 	option max_latency_ms '2000'
 	option spread_max_pct '200'
+
+	# 整轮噪声保护：过半候选同时判为不稳时跳过本轮判决，不消耗确认轮数
+	option noise_guard '1'
 
 	# 切换：领先多少百分比、连续几轮才生效
 	option switch_margin '15'
@@ -44,7 +48,7 @@ config bestip 'main'
 	option distinct_factor '150'
 
 	# 写完后是否 HUP dnsmasq
-	option dnsmasq_reload '1'
+	option dnsmasq_reload '0'
 
 	# 可选：绑 WAN 网卡，多出口/VPN 时用
 	option interface ''

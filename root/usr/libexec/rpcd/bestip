@@ -4,7 +4,17 @@
 #
 . /usr/share/libubox/jshn.sh
 
-BESTIP=/usr/sbin/bestip
+BESTIP=/usr/local/bin/bestip
+SEC=
+
+# 带线路名调用；SEC 为空时用引擎自己的默认线路
+bp() {
+	if [ -n "$SEC" ]; then
+		"$BESTIP" -s "$SEC" "$@"
+	else
+		"$BESTIP" "$@"
+	fi
+}
 
 case "$1" in
 	list)
@@ -24,9 +34,12 @@ case "$1" in
 		;;
 	call)
 		read -r input
+		if [ -n "$input" ]; then
+			json_load "$input" 2>/dev/null && json_get_var SEC section
+		fi
 		case "$2" in
 			status)
-				"$BESTIP" status
+				bp status
 				;;
 			history)
 				n=20
@@ -35,14 +48,14 @@ case "$1" in
 				fi
 				# ubus 的返回值必须是对象，数组要包一层
 				printf '{"records":'
-				"$BESTIP" history "${n:-20}"
+				bp history "${n:-20}"
 				printf '}'
 				;;
 			run)
-				if "$BESTIP" busy; then
+				if bp busy; then
 					printf '{"started":false,"reason":"busy"}\n'
 				else
-					"$BESTIP" run --force >/dev/null 2>&1 &
+					bp run --force >/dev/null 2>&1 &
 					printf '{"started":true}\n'
 				fi
 				;;

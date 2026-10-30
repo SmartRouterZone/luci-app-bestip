@@ -4,10 +4,11 @@
 'require rpc';
 'require dom';
 'require ui';
+'require uci';
 
-var callStatus  = rpc.declare({ object: 'bestip', method: 'status', expect: { '': {} } });
-var callHistory = rpc.declare({ object: 'bestip', method: 'history', params: [ 'count' ], expect: { '': {} } });
-var callRun     = rpc.declare({ object: 'bestip', method: 'run', expect: {} });
+var callStatus  = rpc.declare({ object: 'bestip', method: 'status', params: [ 'section' ], expect: { '': {} } });
+var callHistory = rpc.declare({ object: 'bestip', method: 'history', params: [ 'count', 'section' ], expect: { '': {} } });
+var callRun     = rpc.declare({ object: 'bestip', method: 'run', params: [ 'section' ], expect: {} });
 
 function ms(v) {
 	if (v === null || v === undefined || v <= 0 || v >= 90000)
@@ -16,15 +17,15 @@ function ms(v) {
 }
 
 function range(a, b) {
-	if (a === null || a === undefined || b === null || b === undefined)
+	if (!a || !b)
 		return '—';
 	return a + '–' + b + ' ms';
 }
 
 function ratioTip(c) {
-	if (!c.ratio || !c.med)
+	if (!c.ratio || !c.rtt)
 		return '';
-	return '最慢 ' + c.max + ' ms ÷ 中位数 ' + c.med + ' ms = ' + (c.ratio / 100).toFixed(1) + ' 倍';
+	return 'ping:443 最慢 ' + c.rtt_max + ' ms ÷ 中位数 ' + c.rtt + ' ms = ' + (c.ratio / 100).toFixed(1) + ' 倍';
 }
 
 function clock(ts) {
@@ -40,14 +41,14 @@ function row(title, value) {
 	]);
 }
 
-function statusSection(data) {
+function statusSection(data, line) {
 	var st = data.state || {};
 	var cur = st.current || [];
 	var busy = data.busy ? E('em', {}, [ _('拨测中…') ]) : '';
 
 	return [
 		row(_('解析'), E('span', {}, [
-			E('strong', {}, [ st.hostname || 'best.local' ]),
+			E('strong', {}, [ st.hostname || 'best.host' ]),
 			' → ',
 			cur.length ? E('code', {}, [ cur.join(' , ') ]) : E('em', {}, [ _('尚无结果') ]),
 			' ',
@@ -61,7 +62,7 @@ function statusSection(data) {
 			E('button', {
 				'class': 'btn cbi-button cbi-button-apply',
 				'click': function() {
-					return callRun().then(function(r) {
+					return callRun(line).then(function(r) {
 						if (r && r.started)
 							ui.addNotification(null, E('p', {}, [ _('已开始一轮拨测，约 20 秒后刷新') ]), 'info');
 						else
@@ -80,6 +81,7 @@ function candidateTable(st) {
 	var head = E('tr', { 'class': 'tr table-titles' }, [
 		E('th', { 'class': 'th' }, [ 'IP' ]),
 		E('th', { 'class': 'th' }, [ _('落地') ]),
+		E('th', { 'class': 'th' }, [ 'ping:443' ]),
 		E('th', { 'class': 'th' }, [ _('TLS 握手') ]),
 		E('th', { 'class': 'th' }, [ _('抖动范围') ]),
 		E('th', { 'class': 'th' }, [ _('失败') ]),
@@ -95,9 +97,10 @@ function candidateTable(st) {
 		return E('tr', { 'class': 'tr', 'style': style }, [
 			E('td', { 'class': 'td' }, [ c.ip ]),
 			E('td', { 'class': 'td' }, [ c.pop || '—' ]),
+			E('td', { 'class': 'td' }, [ ms(c.rtt) ]),
 			E('td', { 'class': 'td' }, [ ms(c.med) ]),
 			E('td', { 'class': 'td', 'title': ratioTip(c) }, [
-				range(c.min, c.max),
+				range(c.rtt_min, c.rtt_max),
 				c.unstable ? E('span', { 'style': 'color:#e57373' }, [ ' ⚠' ]) : ''
 			]),
 			E('td', { 'class': 'td' }, [ String(c.fails || 0) ]),
@@ -106,11 +109,46 @@ function candidateTable(st) {
 		]);
 	});
 
+	var basis = [
+		_('门槛：失败 ≤ 1 次、握手中位数 ≤ 2000 ms、抖动 ≤ 2 倍，全部通过才算合格。'),
+		_('排序：合格 → 稳定 → 握手中位数 → 首字节，取前 2 个。'),
+		_('切换：现任合格时，挑战者需领先 15% 且连续 2 轮；现任不合格则立即切换。')
+	];
+
+	var notes = [
+		[ _('ping:443'), _('TCP 建连 443 端口耗时，即 tcping:443，非 ICMP；5 次取中位数。') ],
+		[ _('TLS 握手'), _('自请求发起到 TLS 握手完成，含建连耗时；受本机 CPU 影响，仅供参考。') ],
+		[ _('抖动范围'), _('5 次建连耗时的最小值–最大值；⚠ 表示最大值超过中位数 2 倍。') ],
+		[ _('失败'), _('5 次中连接失败次数；超过上限（默认 1 次）判为淘汰。') ],
+		[ _('分数'), _('0–100 综合评分，仅展示，不参与选路。') ],
+		[ _('状态'), _('现任：生效中；新选：本轮选中，下轮生效；落选：合格未入选；淘汰：未过门槛。') ]
+	];
+
+	// 注意：LuCI 的 E() 不展开嵌套数组，子节点必须平铺传入，
+	// 否则数组会被字符串化成 [object HTMLElement]
+	var li = function() {
+		return E('li', { 'style': 'margin:.12em 0' }, Array.prototype.slice.call(arguments));
+	};
+
+	var noteBox = E('div', {
+		'style': 'margin-top:1em;padding:.6em .9em;border-radius:4px;' +
+			'background:rgba(128,128,128,.14);color:#666;font-size:12px;line-height:1.75'
+	}, [
+		E('div', { 'style': 'font-weight:bold;margin-bottom:.25em' }, [ _('说明') ]),
+		E('ul', { 'style': 'margin:0;padding-left:1.1em' }, [
+			E('li', {}, [
+				E('strong', {}, [ _('优选依据') ]), '：',
+				E('ul', { 'style': 'margin:.15em 0 .55em;padding-left:1.1em;list-style:circle' },
+					basis.map(function(t) { return li(t); }))
+			])
+		].concat(notes.map(function(kv) {
+			return li(E('strong', {}, [ kv[0] ]), '：' + kv[1]);
+		})))
+	]);
+
 	return E('div', {}, [
 		E('table', { 'class': 'table' }, [ head ].concat(body)),
-		E('p', { 'class': 'cbi-section-descr' }, [
-			_('⚠ 表示最慢一次超过中位数的 2 倍（鼠标悬停可看具体倍数），这类 IP 会被排到后面。')
-		])
+		noteBox
 	]);
 }
 
@@ -155,36 +193,85 @@ function chartSvg(hist) {
 	return E('p', {}, [ _('当前 LuCI 版本不支持图表') ]);
 }
 
+function chartBlock(hist) {
+	return E('div', {}, [
+		E('h3', {}, [ '最近 ' + Math.min(96, hist.length) + ' 轮握手延迟' ]),
+		chartSvg(hist)
+	]);
+}
+
+function lineNames() {
+	return (uci.sections('bestip', 'bestip') || []).map(function(s) {
+		return s.name || s['.name'];
+	}).filter(function(n) { return n; });
+}
+
+function lineLabel(sid) {
+	return uci.get('bestip', sid, 'hostname') || sid;
+}
+
 return view.extend({
 	load: function() {
-		return Promise.all([
-			callStatus(),
-			callHistory(96).then(function(r) { return (r && r.records) || []; },
-				function() { return []; })
-		]);
+		return uci.load('bestip').then(function() {
+			var lines = lineNames();
+			var line = lines.length ? lines[0] : null;
+
+			return Promise.all([
+				lines,
+				callStatus(line),
+				callHistory(96, line).then(function(r) { return (r && r.records) || []; },
+					function() { return []; })
+			]);
+		});
 	},
 
 	render: function(data) {
 		var self = this;
-		var status = data[0] || {};
-		var hist = data[1] || [];
+		var lines  = data[0] || [];
+		var line   = lines.length ? lines[0] : null;
+		var status = data[1] || {};
+		var hist   = data[2] || [];
 
-		this.statusNode = E('div', { 'class': 'cbi-section' }, [ E('div', {}, statusSection(status)) ]);
+		this.statusNode = E('div', { 'class': 'cbi-section' }, [ E('div', {}, statusSection(status, line)) ]);
 		this.tableNode  = E('div', { 'class': 'cbi-section' }, [ candidateTable(status.state) ]);
-		this.chartNode  = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, [ _('最近 96 轮握手延迟') ]),
-			chartSvg(hist)
-		]);
+		this.chartNode  = E('div', { 'class': 'cbi-section' }, [ chartBlock(hist) ]);
+
+		function reload() {
+			return Promise.all([ callStatus(line), callHistory(96, line) ]).then(function(d) {
+				dom.content(self.statusNode, E('div', {}, statusSection(d[0] || {}, line)));
+				dom.content(self.tableNode, candidateTable((d[0] || {}).state));
+				dom.content(self.chartNode, chartBlock((d[1] && d[1].records) || []));
+			});
+		}
+
+		var picker = '';
+
+		if (lines.length > 1) {
+			picker = E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, [ _('线路') ]),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('select', {
+						'class': 'cbi-input-select',
+						'change': function(ev) {
+							line = ev.target.value;
+							return reload();
+						}
+					}, lines.map(function(n) {
+						return E('option', { 'value': n, 'selected': (n === line) || null }, [ lineLabel(n) ]);
+					}))
+				])
+			]);
+		}
 
 		poll.add(function() {
-			return callStatus().then(function(d) {
-				dom.content(self.statusNode, E('div', {}, statusSection(d)));
+			return callStatus(line).then(function(d) {
+				dom.content(self.statusNode, E('div', {}, statusSection(d, line)));
 				dom.content(self.tableNode, candidateTable(d.state));
 			});
 		}, 5);
 
 		return E('div', {}, [
-			E('h2', {}, [ _('优选 IP') ]),
+			picker,
 			this.statusNode,
 			this.tableNode,
 			this.chartNode

@@ -17,7 +17,7 @@ config bestip 'main'
 	option enabled '1'
 	option interval '60'
 	option target 'https://dash.cloudflare.com/favicon.ico'
-	option hostname 'best.local'
+	option hostname 'best.host'
 	option hosts_file '$T/best.hosts'
 	option state_dir '$T/state'
 	list pool '172.64.229.0/24'
@@ -36,15 +36,15 @@ export BESTIP_CONF="$CONF"
 i=1
 while [ "$i" -le "$ROUNDS" ]; do
 	echo "===== 第 $i 轮 ====="
-	sh root/usr/sbin/bestip run --force || exit 1
+	sh root/usr/local/bin/bestip run --force || exit 1
 	i=$((i + 1))
 done
 
 echo
-sh root/usr/sbin/bestip show
+sh root/usr/local/bin/bestip show
 echo
 echo "hosts:"
 cat "$T/best.hosts" 2>/dev/null
 echo
-echo "状态: $(sh root/usr/sbin/bestip status | head -c 200)..."
+echo "状态: $(sh root/usr/local/bin/bestip status | head -c 200)..."
 echo "临时目录: $T"

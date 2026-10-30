@@ -25,6 +25,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 PROG=bestip
 CONF=${BESTIP_CONF:-/etc/config/bestip}
+SECTION=${BESTIP_SECTION:-}
 TAB=$(printf '\t')
 
 err()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
@@ -33,7 +34,7 @@ log() {
 	_dir=${STATE_DIR:-/tmp/bestip}
 	mkdir -p "$_dir" 2>/dev/null
 	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$_dir/bestip.log" 2>/dev/null
-	logger -t "$PROG" "$*" 2>/dev/null || true
+	logger -t "$PROG[${SECTION:-main}]" "$*" 2>/dev/null || true
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 num()  { case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
@@ -44,13 +45,29 @@ uci_ok() { [ -z "${BESTIP_NO_UCI:-}" ] && have uci; }
 
 # ---------------------------------------------------------------- 配置读取
 
+first_section() {
+	if uci_ok; then
+		uci -q show bestip 2>/dev/null | sed -n 's/^bestip\.\([^.=]*\)=bestip$/\1/p' | head -n1
+	else
+		awk '$1 == "config" && $2 == "bestip" { print $3; exit }' "$CONF" 2>/dev/null | tr -d "'\""
+	fi
+}
+
+all_sections() {
+	if uci_ok; then
+		uci -q show bestip 2>/dev/null | sed -n 's/^bestip\.\([^.=]*\)=bestip$/\1/p'
+	else
+		awk '$1 == "config" && $2 == "bestip" { print $3 }' "$CONF" 2>/dev/null | tr -d "'\""
+	fi
+}
+
 cfg_get() {
 	_k=$1 _d=$2 _v=
 	if uci_ok; then
-		_v=$(uci -q get "bestip.main.$_k" 2>/dev/null) || _v=
+		_v=$(uci -q get "bestip.$SECTION.$_k" 2>/dev/null) || _v=
 	else
-		_v=$(awk -v k="$_k" '
-			$1 == "config" { insec = ($2 == "bestip") }
+		_v=$(awk -v k="$_k" -v s="$SECTION" -v q="'" '
+			$1 == "config" { insec = ($2 == "bestip" && (NF < 3 || $3 == s || $3 == q s q)) }
 			insec && $1 == "option" && $2 == k { v = $3; sub(/^[^ ]+ +[^ ]+ +/, "", v); print v; exit }
 		' "$CONF" 2>/dev/null) || _v=
 		_v=$(printf '%s' "$_v" | tr -d "'\"")
@@ -62,10 +79,10 @@ cfg_list() {
 	_k=$1
 	if uci_ok; then
 		# 新版 uci 的 show 会把 list 打在同一行，直接用 get 更稳
-		uci -q get "bestip.main.$_k" 2>/dev/null | tr ' ' '\n'
+		uci -q get "bestip.$SECTION.$_k" 2>/dev/null | tr ' ' '\n'
 	else
-		awk -v k="$_k" '
-			$1 == "config" { insec = ($2 == "bestip") }
+		awk -v k="$_k" -v s="$SECTION" -v q="'" '
+			$1 == "config" { insec = ($2 == "bestip" && (NF < 3 || $3 == s || $3 == q s q)) }
 			insec && $1 == "list" && $2 == k { v = $3; sub(/^[^ ]+ +[^ ]+ +/, "", v); print v }
 		' "$CONF" 2>/dev/null | tr -d "'\""
 	fi
@@ -79,11 +96,14 @@ cfg_bool() {
 }
 
 load_conf() {
+	[ -n "$SECTION" ] || SECTION=$(first_section)
+	[ -n "$SECTION" ] || SECTION=main
+
 	INTERVAL=$(num "$(cfg_get interval 600)" 600)
 	TARGET=$(cfg_get target 'https://dash.cloudflare.com/favicon.ico')
-	HOSTNAME=$(cfg_get hostname 'best.local')
-	HOSTS_FILE=$(cfg_get hosts_file '/tmp/best.hosts')
-	STATE_DIR=$(cfg_get state_dir '/tmp/bestip')
+	HOSTNAME=$(cfg_get hostname '')
+	HOSTS_FILE=$(cfg_get hosts_file '/tmp/bestip.host')
+	STATE_DIR=$(cfg_get state_dir "/tmp/bestip/$HOSTNAME")
 	SAMPLE_NEW=$(num "$(cfg_get sample_new 8)" 8)
 	KEEP=$(num "$(cfg_get keep 2)" 2)
 	ROUNDS=$(num "$(cfg_get rounds 5)" 5)
@@ -95,6 +115,7 @@ load_conf() {
 	SPREAD_MAX=$(num "$(cfg_get spread_max_pct 200)" 200)
 	MARGIN=$(num "$(cfg_get switch_margin 15)" 15)
 	CONFIRM=$(num "$(cfg_get confirm_rounds 2)" 2)
+	NOISE_GUARD=$(num "$(cfg_get noise_guard 1)" 1)
 	PREFER_DISTINCT=$(num "$(cfg_get prefer_distinct_pool 1)" 1)
 	DISTINCT_FACTOR=$(num "$(cfg_get distinct_factor 150)" 150)
 	DNSMASQ_HUP=$(num "$(cfg_get dnsmasq_reload 1)" 1)
@@ -201,23 +222,24 @@ probe_one() {
 		--connect-timeout "$CTIMEOUT" --max-time "$MTIME" \
 		$IFOPT \
 		-H 'Cache-Control: no-cache' \
-		-w '%{time_appconnect} %{time_starttransfer} %{http_code}' \
+		-w '%{time_appconnect} %{time_starttransfer} %{time_connect} %{http_code}' \
 		"$URL" 2>/dev/null) || _rc=$?
 
 	if [ "$_rc" -ne 0 ] || [ -z "$_out_s" ]; then
-		printf 'FAIL 0 0 -\n' >> "$_out"
+		printf 'FAIL 0 0 0 -\n' >> "$_out"
 		rm -f "$_hdr"
 		return 0
 	fi
 
 	set -- $_out_s
-	_a=$1 _t=$2 _c=$3
+	_a=$1 _t=$2 _cn=$3 _c=$4
 	_am=$(awk -v v="$_a" 'BEGIN { printf "%.0f", v * 1000 }')
 	_tm=$(awk -v v="$_t" 'BEGIN { printf "%.0f", v * 1000 }')
+	_cm=$(awk -v v="$_cn" 'BEGIN { printf "%.0f", v * 1000 }')
 	_pop=$(awk 'tolower($1) == "cf-ray:" { gsub(/\r/, ""); n = split($0, x, "-"); print x[n] }' "$_hdr" 2>/dev/null | tail -n 1)
 
 	rm -f "$_hdr"
-	printf '%s %s %s %s\n' "$_am" "$_tm" "$_c" "${_pop:--}" >> "$_out"
+	printf '%s %s %s %s %s\n' "$_am" "$_tm" "$_cm" "$_c" "${_pop:--}" >> "$_out"
 }
 
 stats_ip() {
@@ -227,7 +249,7 @@ stats_ip() {
 	_okn=$((_n - _fails))
 
 	if [ "$_okn" -le 0 ]; then
-		printf '99999 0 %s 0 0 0 -\n' "$_fails"
+		printf '99999 0 %s 0 0 0 - 0 0 0\n' "$_fails"
 		return 0
 	fi
 
@@ -236,21 +258,34 @@ stats_ip() {
 		END {
 			if (NR % 2) med = a[(NR + 1) / 2];
 			else med = (a[NR / 2] + a[NR / 2 + 1]) / 2;
-			ratio = (med > 0) ? (a[NR] * 100 / med) : 0;
-			printf "%.0f %.0f %.0f %.0f", med, a[1], a[NR], ratio
+			printf "%.0f %.0f %.0f", med, a[1], a[NR]
 		}')
 	set -- $_line
-	_med=$1 _min=$2 _max=$3 _ratio=$4
+	_med=$1 _min=$2 _max=$3
 
 	_ttfb=$(awk '$1 != "FAIL" { print $2 }' "$_f" | sort -n | awk '
 		{ a[NR] = $1 }
 		END { if (NR % 2) print a[(NR + 1) / 2]; else printf "%.0f", (a[NR / 2] + a[NR / 2 + 1]) / 2 }')
 
-	_pop=$(awk '$1 != "FAIL" && $4 != "-" { c[$4]++ } END {
+	# TCP 握手（等同 ping :443）：不含 TLS 加密开销，抖动判定用它
+	_rline=$(awk '$1 != "FAIL" { print $3 }' "$_f" | sort -n | awk '
+		{ a[NR] = $1 }
+		END {
+			if (NR % 2) med = a[(NR + 1) / 2];
+			else med = (a[NR / 2] + a[NR / 2 + 1]) / 2;
+			ratio = (med > 0) ? (a[NR] * 100 / med) : 0;
+			printf "%.0f %.0f %.0f %.0f", med, a[1], a[NR], ratio
+		}')
+	set -- $_rline
+	_rtt=${1:-0} _rmin=${2:-0} _rmax=${3:-0} _ratio=${4:-0}
+
+	_pop=$(awk '$1 != "FAIL" && $5 != "-" { c[$5]++ } END {
 		for (k in c) if (c[k] > m) { m = c[k]; p = k }
 		printf "%s", (p == "") ? "-" : p }' "$_f")
 
-	printf '%s %s %s %s %s %s %s\n' "$_med" "$_ttfb" "$_fails" "$_ratio" "$_min" "$_max" "$_pop"
+	printf '%s %s %s %s %s %s %s %s %s %s\n' \
+		"$_med" "$_ttfb" "$_fails" "$_ratio" "$_min" "$_max" "$_pop" \
+		"$_rtt" "$_rmin" "$_rmax"
 }
 
 probe_all() {
@@ -276,10 +311,11 @@ rank_build() {
 		[ -f "$WORK/$_ip.tsv" ] || continue
 		set -- $(stats_ip "$WORK/$_ip.tsv")
 		_med=$1 _ttfb=$2 _fails=$3 _ratio=$4 _min=$5 _max=$6 _pop=$7
+		_rtt=$8 _rmin=$9 _rmax=${10}
 
 		_q=0
 		[ "$_fails" -le "$MAX_FAILS" ] && [ "$_med" -le "$MAX_LAT" ] && _q=1
-		# 最慢一次超过中位数的 SPREAD_MAX%，或有失败，都排到稳定候选之后
+		# ping:443 最慢一次超过中位数的 SPREAD_MAX%，或有失败，都排到稳定候选之后
 		_s=0
 		[ "$_ratio" -gt "$SPREAD_MAX" ] && _s=1
 		[ "$_fails" -gt 0 ] && _s=1
@@ -296,12 +332,19 @@ rank_build() {
 		fi
 
 		_pkey=${_ip%.*}
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"$((1 - _q))" "$_s" "$(pad6 "$_med")" "$(pad6 "$_ttfb")" \
 			"$_ip" "$_pkey" "$_med" "$_min" "$_max" "$_ratio" "$_fails" "$_pop" "$_score" \
+			"$_rtt" "$_rmin" "$_rmax" \
 			>> "$WORK/rank.tsv"
 	done
 	sort -t "$TAB" -k1,1 -k2,2 -k3,3 -k4,4 "$WORK/rank.tsv" -o "$WORK/rank.tsv" 2>/dev/null
+
+	# 整轮噪声：过半候选同时判为不稳，说明是链路/环境在抖，不是某个 IP 的问题
+	NOISY=0
+	_n_tot=$(wc -l < "$WORK/rank.tsv")
+	_n_bad=$(awk -F'\t' '$2 == 1 { n++ } END { print n + 0 }' "$WORK/rank.tsv")
+	[ "$_n_tot" -gt 0 ] && [ "$((_n_bad * 2))" -gt "$_n_tot" ] && NOISY=1
 }
 
 select_ips() {
@@ -385,6 +428,14 @@ decide() {
 		return 0
 	fi
 
+	# 本轮整体不可信时不判决，也不消耗确认计数（现任掉出门槛仍然立即切）
+	if [ "$NOISY" = 1 ] && [ "$NOISE_GUARD" = 1 ]; then
+		SWITCHED=0
+		REASON="本轮整体抖动异常，跳过判决"
+		CUR_AFTER="$CURIPS"
+		return 0
+	fi
+
 	_qn=$(quality_of "$NEWSET")
 	_qc=$(quality_of "$CURSET")
 
@@ -406,7 +457,7 @@ decide() {
 			rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
 		else
 			SWITCHED=0
-			REASON="待确认 $_cnt/${CONFIRM}（领先幅度已达标）"
+			REASON="待确认 ${_cnt}/${CONFIRM}：已领先 ${MARGIN}%，需连续 ${CONFIRM} 轮一致才切换"
 			CUR_AFTER="$CURIPS"
 		fi
 	else
@@ -426,19 +477,37 @@ reload_dns() {
 }
 
 apply_hosts() {
+	[ -n "$CUR_AFTER" ] || return 0
+
 	mkdir -p "$(dirname "$HOSTS_FILE")" 2>/dev/null
+
+	# 多条线路写同一个 hosts 文件，加个短锁，避免互相覆盖
+	_lock="$HOSTS_FILE.lock"
+	_n=0
+	while ! mkdir "$_lock" 2>/dev/null; do
+		_n=$((_n + 1))
+		if [ "$_n" -ge 10 ]; then
+			err "hosts 文件被占用，跳过本次写入"
+			return 0
+		fi
+		sleep 1
+	done
+
 	_tmp="$HOSTS_FILE.tmp.$$"
-	: > "$_tmp"
+	# 只替换本线路 hostname 的行，其它线路的行原样保留
+	if [ -f "$HOSTS_FILE" ]; then
+		awk -v h="$HOSTNAME" '$2 != h' "$HOSTS_FILE" > "$_tmp" 2>/dev/null || : > "$_tmp"
+	else
+		: > "$_tmp"
+	fi
 	for _ip in $CUR_AFTER; do
 		printf '%s %s\n' "$_ip" "$HOSTNAME" >> "$_tmp"
 	done
-	if [ -s "$_tmp" ]; then
-		mv "$_tmp" "$HOSTS_FILE"
-		chmod 644 "$HOSTS_FILE" 2>/dev/null
-		reload_dns
-	else
-		rm -f "$_tmp"
-	fi
+	mv "$_tmp" "$HOSTS_FILE"
+	chmod 644 "$HOSTS_FILE" 2>/dev/null
+	rmdir "$_lock" 2>/dev/null
+
+	reload_dns
 }
 
 write_state() {
@@ -469,7 +538,7 @@ write_state() {
 
 		printf '"candidates":['
 		_first=1
-		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score; do
+		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score _rtt _rmin _rmax; do
 			[ "$_first" = 1 ] || printf ','
 			_first=0
 			_sel=0
@@ -479,8 +548,8 @@ write_state() {
 			# unstable 只表示"波动超标"，失败次数单独看，别混在一起
 			_u=false
 			[ "$_ratio" -gt "$SPREAD_MAX" ] && _u=true
-			printf '{"ip":"%s","pool":"%s","med":%s,"min":%s,"max":%s,"ratio":%s,"fails":%s,"pop":"%s","score":%s,"unstable":%s,"qualified":%s,"selected":%s,"current":%s}' \
-				"$_ip" "$_pool" "$_med" "$_min" "$_max" "$_ratio" "$_fails" "${_pop:--}" "$_score" \
+			printf '{"ip":"%s","pool":"%s","med":%s,"min":%s,"max":%s,"rtt":%s,"rtt_min":%s,"rtt_max":%s,"ratio":%s,"fails":%s,"pop":"%s","score":%s,"unstable":%s,"qualified":%s,"selected":%s,"current":%s}' \
+				"$_ip" "$_pool" "$_med" "$_min" "$_max" "$_rtt" "$_rmin" "$_rmax" "$_ratio" "$_fails" "${_pop:--}" "$_score" \
 				"$_u" \
 				"$([ "$_q" = 0 ] && echo true || echo false)" \
 				"$([ "$_sel" = 1 ] && echo true || echo false)" \
@@ -503,7 +572,7 @@ write_history() {
 		done
 		printf '],"sel":['
 		_first=1
-		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score; do
+		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score _rtt _rmin _rmax; do
 			in_list "$_ip" "$CUR_AFTER" || continue
 			[ "$_first" = 1 ] || printf ','
 			_first=0
@@ -547,6 +616,8 @@ cleanup() {
 
 run_once() {
 	START=$(date +%s)
+	[ -n "$HOSTNAME" ] || { err "未设置解析域名，跳过"; return 1; }
+
 	mkdir -p "$STATE_DIR" || { err "无法创建 $STATE_DIR"; return 1; }
 
 	if ! lock; then
@@ -612,14 +683,53 @@ run_once() {
 run_loop() {
 	_STOP=0
 	trap '_STOP=1' TERM INT
-	load_conf
-	while [ "$_STOP" = 0 ]; do
+
+	# 手动指定线路时只跑这一条（调试用）
+	if [ -n "$SECTION" ]; then
 		load_conf
-		if cfg_bool enabled 1; then
-			run_once
-		fi
+		while [ "$_STOP" = 0 ]; do
+			load_conf
+			cfg_bool enabled 1 && run_once
+			[ "$_STOP" = 1 ] && break
+			sleep "$INTERVAL"
+		done
+		exit 0
+	fi
+
+	# 否则每轮扫一遍配置里现有的线路：新增、删除线路都不用重启服务
+	while [ "$_STOP" = 0 ]; do
+		_now=$(date +%s)
+		_wait=15
+
+		for _sec in $(all_sections); do
+			SECTION=$_sec
+			load_conf
+			cfg_bool enabled 1 || continue
+
+			_due=$(sed -n 's/.*"next_run":\([0-9]*\).*/\1/p' "$STATE_DIR/state.json" 2>/dev/null)
+			[ -n "$_due" ] || _due=0
+			_retry=$(cat "$STATE_DIR/retry_at" 2>/dev/null)
+			if [ -n "$_retry" ] && [ "$_retry" -gt "$_due" ]; then
+				_due=$_retry
+			fi
+
+			if [ "$_now" -ge "$_due" ]; then
+				rm -f "$STATE_DIR/retry_at"
+				if ! run_once; then
+					mkdir -p "$STATE_DIR" 2>/dev/null
+					printf '%s' "$((_now + INTERVAL))" > "$STATE_DIR/retry_at" 2>/dev/null
+				fi
+			else
+				_left=$((_due - _now))
+				[ "$_left" -lt "$_wait" ] && _wait=$_left
+			fi
+
+			[ "$_STOP" = 1 ] && break
+		done
+
 		[ "$_STOP" = 1 ] && break
-		sleep "$INTERVAL"
+		[ "$_wait" -lt 1 ] && _wait=1
+		sleep "$_wait"
 	done
 	exit 0
 }
@@ -661,8 +771,8 @@ cmd_show() {
 		echo "还没有运行过"
 		return 0
 	fi
-	printf '%-16s %-6s %8s %14s %5s %7s\n' IP 落地 TLS握手ms 抖动范围 失败 分数
-	awk -F'\t' '{ printf "%-16s %-6s %8s %14s %5s %7s\n", $5, $12, $7, $8"-"$9, $11, $13 }' "$STATE_DIR/rank.tsv"
+	printf '%-16s %-6s %8s %10s %14s %5s %7s\n' IP 落地 ping443 TLS握手ms 抖动范围 失败 分数
+	awk -F'\t' '{ printf "%-16s %-6s %8s %10s %14s %5s %7s\n", $5, $12, $14, $7, $15"-"$16, $11, $13 }' "$STATE_DIR/rank.tsv"
 	if [ -f "$STATE_DIR/state.json" ]; then
 		printf '\n状态: %s\n' "$(sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$STATE_DIR/state.json")"
 	fi
@@ -723,6 +833,13 @@ cmd_unsetup() {
 }
 
 main() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-s|--section) SECTION=${2:-}; shift 2 || shift ;;
+			*) break ;;
+		esac
+	done
+
 	_cmd=${1:-status}
 	[ $# -gt 0 ] && shift
 
@@ -751,7 +868,7 @@ main() {
 		unsetup) cmd_unsetup ;;
 		version) echo "bestip 1.0.0" ;;
 		*)
-			echo "用法: bestip {run [--force] [--loop]|status|history [N]|show|log [N]|setup|unsetup}"
+			echo "用法: bestip [-s 线路] {run [--force] [--loop]|status|history [N]|show|log [N]|setup|unsetup}"
 			return 1
 			;;
 	esac
