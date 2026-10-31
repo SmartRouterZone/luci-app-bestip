@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# rpcd 后端：LuCI 只通过 ubus 调这里，不直接碰文件
+#
+. /usr/share/libubox/jshn.sh
+
+BESTIP=/usr/local/bin/bestip
+SEC=
+
+# 带线路名调用；SEC 为空时用引擎自己的默认线路
+bp() {
+	if [ -n "$SEC" ]; then
+		"$BESTIP" -s "$SEC" "$@"
+	else
+		"$BESTIP" "$@"
+	fi
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "status"
+		json_close_object
+		json_add_object "history"
+		json_add_int "count" 20
+		json_close_object
+		json_add_object "run"
+		json_close_object
+		json_add_object "setup"
+		json_close_object
+		json_add_object "unsetup"
+		json_close_object
+		json_dump
+		;;
+	call)
+		read -r input
+		if [ -n "$input" ]; then
+			json_load "$input" 2>/dev/null && json_get_var SEC section
+		fi
+		case "$2" in
+			status)
+				bp status
+				;;
+			history)
+				n=20
+				if [ -n "$input" ]; then
+					json_load "$input" 2>/dev/null && json_get_var n count
+				fi
+				# ubus 的返回值必须是对象，数组要包一层
+				printf '{"records":'
+				bp history "${n:-20}"
+				printf '}'
+				;;
+			run)
+				if bp busy; then
+					printf '{"started":false,"reason":"busy"}\n'
+				else
+					bp run --force >/dev/null 2>&1 &
+					printf '{"started":true}\n'
+				fi
+				;;
+			setup)
+				"$BESTIP" setup >/dev/null 2>&1
+				printf '{"ok":true}\n'
+				;;
+			unsetup)
+				"$BESTIP" unsetup >/dev/null 2>&1
+				printf '{"ok":true}\n'
+				;;
+			*)
+				printf '{}\n'
+				;;
+		esac
+		;;
+esac

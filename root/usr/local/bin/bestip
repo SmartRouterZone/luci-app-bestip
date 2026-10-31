@@ -1,0 +1,951 @@
+#!/bin/sh
+#
+# bestip - Cloudflare 优选 IP 引擎
+#
+# 用法:
+#   bestip run [--force] [--loop]   跑一轮 / 常驻循环
+#   bestip status                   输出 JSON 状态（供 ubus）
+#   bestip history [N]              输出最近 N 轮 JSON 数组
+#   bestip show                     命令行查看最近一轮
+#   bestip setup|unsetup            把 hosts 文件挂到 / 摘出 dnsmasq
+#
+# 环境变量:
+#   BESTIP_CONF     配置文件路径，默认 /etc/config/bestip
+#   BESTIP_NO_UCI   非空时不用 uci，直接解析配置文件（本地调试用）
+#
+# 设计要点:
+#   - 每次抽 sample_new 个新 IP + 全部现任一起测（同一时间窗、交错顺序）
+#   - 每个 IP 测 rounds 次，取中位数，抗单次噪声
+#   - 选路用"资格门槛 + 中位数排序"，分数只用于看板展示
+#   - 切换需要领先 switch_margin% 且连续 confirm_rounds 轮，避免抖动
+
+set -u
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+PROG=bestip
+CONF=${BESTIP_CONF:-/etc/config/bestip}
+SECTION=${BESTIP_SECTION:-}
+TAB=$(printf '\t')
+
+err()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+# 只写 tmpfs 里的一份，不再刷系统日志（LuCI 的日志页读的就是这份）
+log() {
+	_dir=${STATE_DIR:-/tmp/bestip}
+	mkdir -p "$_dir" 2>/dev/null
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$_dir/bestip.log" 2>/dev/null
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+num()  { case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+# 种子取自 /dev/urandom（需要 coreutils-od，busybox 不一定带 od）
+rnd() { od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n'; }
+pad6() { printf '%06d' "$(num "$1" 0)" 2>/dev/null || printf '000000'; }
+iso()  { date +%Y-%m-%dT%H:%M:%S%z; }
+uci_ok() { [ -z "${BESTIP_NO_UCI:-}" ] && have uci; }
+
+# ---------------------------------------------------------------- 配置读取
+
+first_section() {
+	if uci_ok; then
+		uci -q show bestip 2>/dev/null | sed -n 's/^bestip\.\([^.=]*\)=bestip$/\1/p' | head -n1
+	else
+		awk '$1 == "config" && $2 == "bestip" { print $3; exit }' "$CONF" 2>/dev/null | tr -d "'\""
+	fi
+}
+
+all_sections() {
+	if uci_ok; then
+		uci -q show bestip 2>/dev/null | sed -n 's/^bestip\.\([^.=]*\)=bestip$/\1/p'
+	else
+		awk '$1 == "config" && $2 == "bestip" { print $3 }' "$CONF" 2>/dev/null | tr -d "'\""
+	fi
+}
+
+cfg_get() {
+	_k=$1 _d=$2 _v=
+	if uci_ok; then
+		_v=$(uci -q get "bestip.$SECTION.$_k" 2>/dev/null) || _v=
+	else
+		_v=$(awk -v k="$_k" -v s="$SECTION" -v q="'" '
+			$1 == "config" { insec = ($2 == "bestip" && (NF < 3 || $3 == s || $3 == q s q)) }
+			insec && $1 == "option" && $2 == k { v = $3; sub(/^[^ ]+ +[^ ]+ +/, "", v); print v; exit }
+		' "$CONF" 2>/dev/null) || _v=
+		_v=$(printf '%s' "$_v" | tr -d "'\"")
+	fi
+	[ -n "$_v" ] && printf '%s' "$_v" || printf '%s' "$_d"
+}
+
+cfg_list() {
+	_k=$1
+	if uci_ok; then
+		# 新版 uci 的 show 会把 list 打在同一行，直接用 get 更稳
+		uci -q get "bestip.$SECTION.$_k" 2>/dev/null | tr ' ' '\n'
+	else
+		awk -v k="$_k" -v s="$SECTION" -v q="'" '
+			$1 == "config" { insec = ($2 == "bestip" && (NF < 3 || $3 == s || $3 == q s q)) }
+			insec && $1 == "list" && $2 == k { v = $3; sub(/^[^ ]+ +[^ ]+ +/, "", v); print v }
+		' "$CONF" 2>/dev/null | tr -d "'\""
+	fi
+}
+
+cfg_bool() {
+	case "$(cfg_get "$1" "$2")" in
+		1|on|true|yes|enabled) return 0 ;;
+	esac
+	return 1
+}
+
+load_conf() {
+	[ -n "$SECTION" ] || SECTION=$(first_section)
+	[ -n "$SECTION" ] || SECTION=main
+
+	INTERVAL=$(num "$(cfg_get interval 600)" 600)
+	TARGET=$(cfg_get target 'https://dash.cloudflare.com/favicon.ico')
+	HOSTNAME=$(cfg_get hostname '')
+	HOSTS_FILE=$(cfg_get hosts_file '/tmp/bestip.host')
+	STATE_DIR=$(cfg_get state_dir "/tmp/bestip/$HOSTNAME")
+	SAMPLE_NEW=$(num "$(cfg_get sample_new 8)" 8)
+	KEEP=$(num "$(cfg_get keep 2)" 2)
+	ROUNDS=$(num "$(cfg_get rounds 5)" 5)
+	CTIMEOUT=$(num "$(cfg_get connect_timeout 3)" 3)
+	MTIME=$(num "$(cfg_get max_time 5)" 5)
+	CONC=$(num "$(cfg_get concurrency 4)" 4)
+	MAX_FAILS=$(num "$(cfg_get max_fails 1)" 1)
+	MAX_LAT=$(num "$(cfg_get max_latency_ms 2000)" 2000)
+	SPREAD_MAX=$(num "$(cfg_get spread_max_pct 200)" 200)
+	MARGIN=$(num "$(cfg_get switch_margin 15)" 15)
+	CONFIRM=$(num "$(cfg_get confirm_rounds 2)" 2)
+	NOISE_GUARD=$(num "$(cfg_get noise_guard 1)" 1)
+	PREFER_DISTINCT=$(num "$(cfg_get prefer_distinct_pool 1)" 1)
+	DISTINCT_FACTOR=$(num "$(cfg_get distinct_factor 150)" 150)
+	DNSMASQ_HUP=$(num "$(cfg_get dnsmasq_reload 1)" 1)
+	FALLBACK_IP=$(cfg_get fallback_ip '')
+	IFACE=$(cfg_get interface '')
+	IFOPT=
+	[ -n "$IFACE" ] && IFOPT="--interface $IFACE"
+
+	POOLS=$(cfg_list pool)
+	[ -n "$POOLS" ] || POOLS=$(printf '172.64.229.0/24\n162.159.38.0/24\n162.159.39.0/24')
+
+	[ "$KEEP" -ge 1 ] || KEEP=1
+	[ "$ROUNDS" -ge 1 ] || ROUNDS=1
+	[ "$CONC" -ge 1 ] || CONC=1
+	[ "$SAMPLE_NEW" -ge 0 ] || SAMPLE_NEW=8
+}
+
+# ---------------------------------------------------------------- 工具
+
+in_list() {
+	case "
+$2
+" in
+		*"
+$1
+"*) return 0 ;;
+	esac
+	return 1
+}
+
+jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/ /g'; }
+
+target_host() {
+	printf '%s' "$TARGET" | sed -e 's#^[A-Za-z][A-Za-z0-9+.-]*://##' -e 's#/.*##' -e 's#:.*##'
+}
+
+shuffle() {
+	# 种子 = urandom + 池名哈希；池名加盐是为了 od 取不到时，多个池也不会抽出同一批尾号
+	awk -v s="$(rnd)" -v salt="${1:-}" '
+		BEGIN {
+			h = 0
+			for (i = 1; i <= length(salt); i++)
+				h = (h * 31 + index("0123456789./", substr(salt, i, 1))) % 65536
+			srand(s + h)
+		}
+		{ print rand(), $0 }' | sort -n | cut -d' ' -f2-
+}
+
+pick_from_pool() {
+	# $1 池（a.b.c.0/24 或单个 IP），$2 个数
+	_p=$1 _q=$2
+	case "$_p" in
+		*/*)
+			_net=${_p%/*}
+			_pre=${_net%.*}
+			seq 1 254 2>/dev/null | shuffle "$_p" | head -n "$_q" | sed "s#^#$_pre.#"
+			;;
+		*)
+			[ "$_q" -ge 1 ] && printf '%s\n' "$_p"
+			;;
+	esac
+}
+
+sample_ips() {
+	_want=$1
+	[ "$_want" -gt 0 ] || return 0
+
+	_total=0 _np=0 _list=
+	for _p in $POOLS; do
+		case "$_p" in
+			*/*)
+				_len=${_p#*/}
+				[ "$_len" = 24 ] || { err "暂只支持 /24: $_p"; continue; }
+				_sz=254
+				;;
+			*)  _sz=1 ;;
+		esac
+		_total=$((_total + _sz))
+		_np=$((_np + 1))
+		_list="$_list $_p"
+	done
+	[ "$_np" -gt 0 ] || return 0
+
+	# 按累计比例四舍五入分配名额，保证三个 /24 都有覆盖
+	_cum=0 _prev=0
+	for _p in $_list; do
+		case "$_p" in */*) _sz=254 ;; *) _sz=1 ;; esac
+		_cum=$((_cum + _sz))
+		_up_to=$(( (_want * _cum * 2 + _total) / (2 * _total) ))
+		_q=$((_up_to - _prev))
+		_prev=$_up_to
+		[ "$_q" -gt 0 ] && pick_from_pool "$_p" "$_q"
+	done
+}
+
+current_ips() {
+	[ -f "$HOSTS_FILE" ] || return 0
+	awk -v h="$HOSTNAME" '$2 == h { print $1 }' "$HOSTS_FILE" | tr -d '\r' | sort -u
+}
+
+# 删掉已不存在的线路在 hosts 文件里留下的行（线路被删除时没人再重写它）
+sweep_hosts() {
+	_live=" " _files=" "
+	for _s in $(all_sections); do
+		SECTION=$_s
+		_h=$(cfg_get hostname '')
+		_f=$(cfg_get hosts_file '/tmp/bestip.host')
+		[ -n "$_h" ] && _live="$_live$_h "
+		case "$_files" in *" $_f "*) ;; *) _files="$_files$_f " ;; esac
+	done
+	for _f in $_files; do
+		[ -f "$_f" ] || continue
+		awk -v live="$_live" '
+			BEGIN { n = split(live, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+			$2 in ok { print }
+		' "$_f" > "$_f.sweep" && mv "$_f.sweep" "$_f"
+	done
+}
+
+# ---------------------------------------------------------------- 拨测
+
+probe_one() {
+	_ip=$1
+	_out="$WORK/$_ip.tsv"
+	_hdr="$WORK/hdr.$_ip"
+
+	_rc=0
+	_out_s=$(curl -sS -o /dev/null -D "$_hdr" \
+		--noproxy '*' \
+		--resolve "$PHOST:443:$_ip" \
+		--connect-timeout "$CTIMEOUT" --max-time "$MTIME" \
+		$IFOPT \
+		-H 'Cache-Control: no-cache' \
+		-w '%{time_appconnect} %{time_starttransfer} %{time_connect} %{http_code}' \
+		"$URL" 2>/dev/null) || _rc=$?
+
+	if [ "$_rc" -ne 0 ] || [ -z "$_out_s" ]; then
+		printf 'FAIL 0 0 0 -\n' >> "$_out"
+		rm -f "$_hdr"
+		return 0
+	fi
+
+	set -- $_out_s
+	_a=$1 _t=$2 _cn=$3 _c=$4
+	_am=$(awk -v v="$_a" 'BEGIN { printf "%.0f", v * 1000 }')
+	_tm=$(awk -v v="$_t" 'BEGIN { printf "%.0f", v * 1000 }')
+	_cm=$(awk -v v="$_cn" 'BEGIN { printf "%.0f", v * 1000 }')
+	_pop=$(awk 'tolower($1) == "cf-ray:" { gsub(/\r/, ""); n = split($0, x, "-"); print x[n] }' "$_hdr" 2>/dev/null | tail -n 1)
+
+	rm -f "$_hdr"
+	printf '%s %s %s %s %s\n' "$_am" "$_tm" "$_cm" "$_c" "${_pop:--}" >> "$_out"
+}
+
+stats_ip() {
+	_f=$1
+	_fails=$(awk '$1 == "FAIL" { n++ } END { print n + 0 }' "$_f")
+	_n=$(awk 'END { print NR + 0 }' "$_f")
+	_okn=$((_n - _fails))
+
+	if [ "$_okn" -le 0 ]; then
+		printf '99999 0 %s 0 0 0 - 0 0 0\n' "$_fails"
+		return 0
+	fi
+
+	_line=$(awk '$1 != "FAIL" { print $1 }' "$_f" | sort -n | awk '
+		{ a[NR] = $1 }
+		END {
+			if (NR % 2) med = a[(NR + 1) / 2];
+			else med = (a[NR / 2] + a[NR / 2 + 1]) / 2;
+			printf "%.0f %.0f %.0f", med, a[1], a[NR]
+		}')
+	set -- $_line
+	_med=$1 _min=$2 _max=$3
+
+	_ttfb=$(awk '$1 != "FAIL" { print $2 }' "$_f" | sort -n | awk '
+		{ a[NR] = $1 }
+		END { if (NR % 2) print a[(NR + 1) / 2]; else printf "%.0f", (a[NR / 2] + a[NR / 2 + 1]) / 2 }')
+
+	# TCP 握手（等同 ping :443）：不含 TLS 加密开销，抖动判定用它
+	_rline=$(awk '$1 != "FAIL" { print $3 }' "$_f" | sort -n | awk '
+		{ a[NR] = $1 }
+		END {
+			if (NR % 2) med = a[(NR + 1) / 2];
+			else med = (a[NR / 2] + a[NR / 2 + 1]) / 2;
+			ratio = (med > 0) ? (a[NR] * 100 / med) : 0;
+			printf "%.0f %.0f %.0f %.0f", med, a[1], a[NR], ratio
+		}')
+	set -- $_rline
+	_rtt=${1:-0} _rmin=${2:-0} _rmax=${3:-0} _ratio=${4:-0}
+
+	_pop=$(awk '$1 != "FAIL" && $5 != "-" { c[$5]++ } END {
+		for (k in c) if (c[k] > m) { m = c[k]; p = k }
+		printf "%s", (p == "") ? "-" : p }' "$_f")
+
+	printf '%s %s %s %s %s %s %s %s %s %s\n' \
+		"$_med" "$_ttfb" "$_fails" "$_ratio" "$_min" "$_max" "$_pop" \
+		"$_rtt" "$_rmin" "$_rmax"
+}
+
+probe_all() {
+	_r=1
+	while [ "$_r" -le "$ROUNDS" ]; do
+		_order=$(printf '%s\n' "$CANDS" | shuffle)
+		_n=0
+		for _ip in $_order; do
+			probe_one "$_ip" &
+			_n=$((_n + 1))
+			if [ "$_n" -ge "$CONC" ]; then wait; _n=0; fi
+		done
+		wait
+		_r=$((_r + 1))
+	done
+}
+
+# ---------------------------------------------------------------- 排名与判决
+
+rank_build() {
+	: > "$WORK/rank.tsv"
+	for _ip in $CANDS; do
+		[ -f "$WORK/$_ip.tsv" ] || continue
+		set -- $(stats_ip "$WORK/$_ip.tsv")
+		_med=$1 _ttfb=$2 _fails=$3 _ratio=$4 _min=$5 _max=$6 _pop=$7
+		_rtt=$8 _rmin=$9 _rmax=${10}
+
+		_q=0
+		[ "$_fails" -le "$MAX_FAILS" ] && [ "$_med" -le "$MAX_LAT" ] && _q=1
+		# ping:443 最慢一次超过中位数的 SPREAD_MAX%，或有失败，都排到稳定候选之后
+		_s=0
+		[ "$_ratio" -gt "$SPREAD_MAX" ] && _s=1
+		[ "$_fails" -gt 0 ] && _s=1
+
+		if [ "$_q" = 1 ]; then
+			_score=$(awk -v m="$_med" -v x="$_max" -v f="$_fails" 'BEGIN {
+				L = 100 * exp(-m / 1215);
+				U = 100 * exp(-x / 1823);
+				A = (f > 0) ? 60 : 100;
+				printf "%.1f", (0.12 * L + 0.10 * U + 0.48 * A) / 0.70
+			}')
+		else
+			_score=0
+		fi
+
+		_pkey=${_ip%.*}
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$((1 - _q))" "$_s" "$(pad6 "$_med")" "$(pad6 "$_ttfb")" \
+			"$_ip" "$_pkey" "$_med" "$_min" "$_max" "$_ratio" "$_fails" "$_pop" "$_score" \
+			"$_rtt" "$_rmin" "$_rmax" \
+			>> "$WORK/rank.tsv"
+	done
+	sort -t "$TAB" -k1,1 -k2,2 -k3,3 -k4,4 "$WORK/rank.tsv" -o "$WORK/rank.tsv" 2>/dev/null
+
+	# 整轮噪声：过半候选同时判为不稳，说明是链路/环境在抖，不是某个 IP 的问题
+	NOISY=0
+	_n_tot=$(wc -l < "$WORK/rank.tsv")
+	_n_bad=$(awk -F'\t' '$2 == 1 { n++ } END { print n + 0 }' "$WORK/rank.tsv")
+	[ "$_n_tot" -gt 0 ] && [ "$((_n_bad * 2))" -gt "$_n_tot" ] && NOISY=1
+}
+
+select_ips() {
+	: > "$WORK/sel"
+
+	if [ "$PREFER_DISTINCT" = 1 ]; then
+		_best=$(awk -F'\t' '$1 == 0 { print $7; exit }' "$WORK/rank.tsv")
+		_pools=" "
+		while read -r _q _s _mp _tp _ip _pool _med _rest; do
+			[ "$_q" = 0 ] || break
+			[ "$_s" = 0 ] || continue
+			[ "$(wc -l < "$WORK/sel")" -ge "$KEEP" ] && break
+			case "$_pools" in *" $_pool "*) continue ;; esac
+			# 只有另一条线的延迟没差太多时，才为了多样化选它
+			[ -n "$_best" ] && [ "$((_med * 100))" -gt "$((_best * DISTINCT_FACTOR))" ] && continue
+			printf '%s %s\n' "$_ip" "$_pool" >> "$WORK/sel"
+			_pools="$_pools$_pool "
+		done < "$WORK/rank.tsv"
+	fi
+
+	while read -r _q _s _mp _tp _ip _pool _rest; do
+		[ "$_q" = 0 ] || break
+		[ "$(wc -l < "$WORK/sel")" -ge "$KEEP" ] && break
+		grep -qxF "$_ip $_pool" "$WORK/sel" >/dev/null 2>&1 && continue
+		printf '%s %s\n' "$_ip" "$_pool" >> "$WORK/sel"
+	done < "$WORK/rank.tsv"
+}
+
+# 用"平均中位数"而不是"总和"，避免两个 IP 反而输给一个 IP
+quality_of() {
+	_sum=0 _n=0
+	for _ip in $1; do
+		_v=$(awk -F'\t' -v ip="$_ip" '$5 == ip { print $7; exit }' "$WORK/rank.tsv")
+		_sum=$((_sum + ${_v:-99999}))
+		_n=$((_n + 1))
+	done
+	[ "$_n" -gt 0 ] || { printf '99999'; return 0; }
+	printf '%s' "$((_sum / _n))"
+}
+
+current_all_ok() {
+	for _ip in $CURIPS; do
+		_q=$(awk -F'\t' -v ip="$_ip" '$5 == ip { print $1; exit }' "$WORK/rank.tsv")
+		[ "${_q:-1}" = 0 ] || return 1
+	done
+	return 0
+}
+
+decide() {
+	NEWSET=$(cut -d' ' -f1 "$WORK/sel" 2>/dev/null | sort -u)
+	CURSET=$(printf '%s\n' "$CURIPS" | sed '/^$/d' | sort -u)
+
+	if [ -z "$NEWSET" ]; then
+		SWITCHED=0
+		REASON="无合格候选，保持现状"
+		CUR_AFTER="$CURIPS"
+		return 0
+	fi
+
+	if [ "$NEWSET" = "$CURSET" ]; then
+		SWITCHED=0
+		REASON="与上次相同"
+		CUR_AFTER="$CURIPS"
+		rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
+		return 0
+	fi
+
+	if [ -z "$CURSET" ]; then
+		SWITCHED=1
+		REASON="首次选举"
+		CUR_AFTER="$NEWSET"
+		rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
+		return 0
+	fi
+
+	if ! current_all_ok; then
+		SWITCHED=1
+		REASON="现任未通过门槛，立即切换"
+		CUR_AFTER="$NEWSET"
+		rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
+		return 0
+	fi
+
+	# 本轮整体不可信时不判决，也不消耗确认计数（现任掉出门槛仍然立即切）
+	if [ "$NOISY" = 1 ] && [ "$NOISE_GUARD" = 1 ]; then
+		SWITCHED=0
+		REASON="本轮整体抖动异常，跳过判决"
+		CUR_AFTER="$CURIPS"
+		return 0
+	fi
+
+	_qn=$(quality_of "$NEWSET")
+	_qc=$(quality_of "$CURSET")
+
+	if awk -v n="$_qn" -v c="$_qc" -v m="$MARGIN" 'BEGIN { exit !(n < c * (1 - m / 100)) }'; then
+		_prev=$(cat "$STATE_DIR/pending" 2>/dev/null)
+		if [ "$_prev" = "$NEWSET" ]; then
+			_cnt=$(num "$(cat "$STATE_DIR/pending.cnt" 2>/dev/null)" 0)
+			_cnt=$((_cnt + 1))
+		else
+			_cnt=1
+		fi
+		printf '%s' "$NEWSET" > "$STATE_DIR/pending"
+		printf '%s' "$_cnt" > "$STATE_DIR/pending.cnt"
+
+		if [ "$_cnt" -ge "$CONFIRM" ]; then
+			SWITCHED=1
+			REASON="挑战者连续 $_cnt 轮领先 ${MARGIN}%"
+			CUR_AFTER="$NEWSET"
+			rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
+		else
+			SWITCHED=0
+			REASON="待确认 ${_cnt}/${CONFIRM}：已领先 ${MARGIN}%，需连续 ${CONFIRM} 轮一致才切换"
+			CUR_AFTER="$CURIPS"
+		fi
+	else
+		SWITCHED=0
+		REASON="领先不足 ${MARGIN}%，保持"
+		CUR_AFTER="$CURIPS"
+		rm -f "$STATE_DIR/pending" "$STATE_DIR/pending.cnt"
+	fi
+}
+
+# ---------------------------------------------------------------- 落盘
+
+reload_dns() {
+	[ "$DNSMASQ_HUP" = 1 ] || return 0
+	have dnsmasq || return 0
+	killall -HUP dnsmasq 2>/dev/null || true
+}
+
+apply_hosts() {
+	[ -n "$CUR_AFTER" ] || return 0
+
+	mkdir -p "$(dirname "$HOSTS_FILE")" 2>/dev/null
+
+	# 多条线路写同一个 hosts 文件，加个短锁，避免互相覆盖
+	_lock="$HOSTS_FILE.lock"
+	_n=0
+	while ! mkdir "$_lock" 2>/dev/null; do
+		_n=$((_n + 1))
+		if [ "$_n" -ge 10 ]; then
+			err "hosts 文件被占用，跳过本次写入"
+			return 0
+		fi
+		sleep 1
+	done
+
+	_tmp="$HOSTS_FILE.tmp.$$"
+	# 只替换本线路 hostname 的行，其它线路的行原样保留
+	if [ -f "$HOSTS_FILE" ]; then
+		awk -v h="$HOSTNAME" '$2 != h' "$HOSTS_FILE" > "$_tmp" 2>/dev/null || : > "$_tmp"
+	else
+		: > "$_tmp"
+	fi
+	for _ip in $CUR_AFTER; do
+		printf '%s %s\n' "$_ip" "$HOSTNAME" >> "$_tmp"
+	done
+	mv "$_tmp" "$HOSTS_FILE"
+	chmod 644 "$HOSTS_FILE" 2>/dev/null
+	rmdir "$_lock" 2>/dev/null
+
+	reload_dns
+}
+
+write_state() {
+	_f="$STATE_DIR/state.json"
+	{
+		printf '{"ok":true,"ts":%s,"time":"%s","enabled":%s,' \
+			"$TS" "$(iso)" "$ENABLED"
+		printf '"hostname":"%s","target":"%s","interval":%s,"next_run":%s,' \
+			"$(jstr "$HOSTNAME")" "$(jstr "$TARGET")" "$INTERVAL" "$NEXT"
+		printf '"switched":%s,"reason":"%s","elapsed_ms":%s,' \
+			"$([ "$SWITCHED" = 1 ] && echo true || echo false)" "$(jstr "$REASON")" "$ELAPSED"
+
+		printf '"current":['
+		_first=1
+		for _ip in $CUR_AFTER; do
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			printf '"%s"' "$_ip"
+		done
+		printf '],"previous":['
+		_first=1
+		for _ip in $CURIPS; do
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			printf '"%s"' "$_ip"
+		done
+		printf '],'
+
+		printf '"candidates":['
+		_first=1
+		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score _rtt _rmin _rmax; do
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			_sel=0
+			in_list "$_ip" "$CUR_AFTER" && _sel=1
+			_was=0
+			in_list "$_ip" "$CURIPS" && _was=1
+			# unstable 只表示"波动超标"，失败次数单独看，别混在一起
+			_u=false
+			[ "$_ratio" -gt "$SPREAD_MAX" ] && _u=true
+			printf '{"ip":"%s","pool":"%s","med":%s,"min":%s,"max":%s,"rtt":%s,"rtt_min":%s,"rtt_max":%s,"ratio":%s,"fails":%s,"pop":"%s","score":%s,"unstable":%s,"qualified":%s,"selected":%s,"current":%s}' \
+				"$_ip" "$_pool" "$_med" "$_min" "$_max" "$_rtt" "$_rmin" "$_rmax" "$_ratio" "$_fails" "${_pop:--}" "$_score" \
+				"$_u" \
+				"$([ "$_q" = 0 ] && echo true || echo false)" \
+				"$([ "$_sel" = 1 ] && echo true || echo false)" \
+				"$([ "$_was" = 1 ] && echo true || echo false)"
+		done < "$WORK/rank.tsv"
+		printf ']}'
+	} > "$_f.tmp" && mv "$_f.tmp" "$_f"
+}
+
+write_history() {
+	_f="$STATE_DIR/history.jsonl"
+	{
+		printf '{"ts":%s,"switched":%s,"reason":"%s","current":[' \
+			"$TS" "$([ "$SWITCHED" = 1 ] && echo true || echo false)" "$(jstr "$REASON")"
+		_first=1
+		for _ip in $CUR_AFTER; do
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			printf '"%s"' "$_ip"
+		done
+		printf '],"sel":['
+		_first=1
+		while IFS="$TAB" read -r _q _s _mp _tp _ip _pool _med _min _max _ratio _fails _pop _score _rtt _rmin _rmax; do
+			in_list "$_ip" "$CUR_AFTER" || continue
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			printf '{"ip":"%s","med":%s,"score":%s}' "$_ip" "$_med" "$_score"
+		done < "$WORK/rank.tsv"
+		printf ']}\n'
+	} >> "$_f"
+
+	if [ "$(wc -l < "$_f")" -gt 2000 ]; then
+		tail -n 1000 "$_f" > "$_f.tmp" && mv "$_f.tmp" "$_f"
+	fi
+}
+
+# ---------------------------------------------------------------- 一轮
+
+lock() {
+	mkdir -p "$STATE_DIR" || return 1
+	if mkdir "$STATE_DIR/lock" 2>/dev/null; then
+		printf '%s' "$$" > "$STATE_DIR/lock/pid"
+		return 0
+	fi
+	_pid=$(cat "$STATE_DIR/lock/pid" 2>/dev/null)
+	if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+		return 1
+	fi
+	rm -rf "$STATE_DIR/lock"
+	if mkdir "$STATE_DIR/lock" 2>/dev/null; then
+		printf '%s' "$$" > "$STATE_DIR/lock/pid"
+		return 0
+	fi
+	return 1
+}
+
+unlock() { rm -rf "$STATE_DIR/lock" 2>/dev/null; }
+
+cleanup() {
+	wait 2>/dev/null
+	rm -rf "$WORK"
+	unlock
+}
+
+run_once() {
+	START=$(date +%s)
+	[ -n "$HOSTNAME" ] || { err "未设置解析域名，跳过"; return 1; }
+
+	mkdir -p "$STATE_DIR" || { err "无法创建 $STATE_DIR"; return 1; }
+
+	if ! lock; then
+		log "已有实例在运行，跳过本轮"
+		return 0
+	fi
+
+	if ! have curl; then
+		log "缺少 curl，请先安装：opkg install curl ca-bundle"
+		return 1
+	fi
+
+	WORK="$STATE_DIR/work"
+	rm -rf "$WORK"
+	mkdir -p "$WORK"
+	trap cleanup EXIT
+
+	PHOST=$(target_host)
+	if [ -z "$PHOST" ]; then
+		log "target 配置非法: $TARGET"
+		cleanup
+		return 1
+	fi
+	case "$TARGET" in
+		*\?*) URL="${TARGET}&cb=$(rnd)" ;;
+		*)    URL="${TARGET}?cb=$(rnd)" ;;
+	esac
+
+	CURIPS=$(current_ips)
+	NEWIPS=$(sample_ips "$SAMPLE_NEW")
+	CANDS=$(printf '%s\n%s\n' "$NEWIPS" "$CURIPS" | sed '/^$/d' | sort -u)
+
+	if [ -z "$CANDS" ]; then
+		log "候选为空（池配置有问题？）"
+		cleanup
+		return 1
+	fi
+
+	probe_all
+	rank_build
+	cp "$WORK/rank.tsv" "$STATE_DIR/rank.tsv" 2>/dev/null
+	select_ips
+	decide
+
+	TS=$(date +%s)
+	ELAPSED=$(( (TS - START) * 1000 ))
+	NEXT=$((TS + INTERVAL))
+	cfg_bool enabled 1 && ENABLED=true || ENABLED=false
+
+	if [ "$SWITCHED" = 1 ]; then
+		apply_hosts
+		log "已切换: $(printf '%s' "$CUR_AFTER" | tr '\n' ' ') ($REASON)"
+	else
+		log "保持: $(printf '%s' "$CURIPS" | tr '\n' ' ') ($REASON)"
+	fi
+
+	write_state
+	write_history
+	cleanup
+	return 0
+}
+
+run_loop() {
+	_STOP=0
+	trap '_STOP=1' TERM INT
+
+	# 单实例：procd 的重启重试会同时拉起多个，用目录锁抢占，后启动的直接退出
+	_pidf=/tmp/bestip/loop.lock
+	mkdir -p /tmp/bestip 2>/dev/null
+	_try=0
+	while :; do
+		if mkdir "$_pidf" 2>/dev/null; then
+			printf '%s' "$$" > "$_pidf/pid"
+			break
+		fi
+		_old=$(cat "$_pidf/pid" 2>/dev/null)
+		if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null; then
+			_cmd=$(tr '\0' ' ' < "/proc/$_old/cmdline" 2>/dev/null)
+			case "$_cmd" in
+				*bestip*) exit 0 ;;
+			esac
+		fi
+		# 抢到锁的实例还没来得及写 pid：等 1 秒再看，连续 3 次判定为残留
+		_try=$((_try + 1))
+		[ "$_try" -ge 3 ] && rm -rf "$_pidf"
+		sleep 1
+	done
+
+	# 手动指定线路时只跑这一条（调试用）
+	if [ -n "$SECTION" ]; then
+		load_conf
+		while [ "$_STOP" = 0 ]; do
+			load_conf
+			cfg_bool enabled 1 && run_once
+			[ "$_STOP" = 1 ] && break
+			# sleep 放后台再 wait：收到 TERM 时 wait 立刻返回，能及时退出
+			sleep "$INTERVAL" &
+			wait $!
+		done
+		rm -rf "$_pidf" 2>/dev/null
+		exit 0
+	fi
+
+	# 否则每轮扫一遍配置里现有的线路：新增、删除线路都不用重启服务
+	_last_sweep=0
+	while [ "$_STOP" = 0 ]; do
+		_now=$(date +%s)
+		_wait=15
+		_any=0
+
+		for _sec in $(all_sections); do
+			SECTION=$_sec
+			load_conf
+			if ! cfg_bool enabled 1; then
+				# 停用的线路：清掉运行时状态（历史、日志、排期），hosts 里的解析保留
+				case "$STATE_DIR" in
+					""|/|/tmp|/tmp/bestip) : ;;
+					*) [ -d "$STATE_DIR" ] && rm -rf "$STATE_DIR" ;;
+				esac
+				continue
+			fi
+			_any=1
+
+			_due=$(sed -n 's/.*"next_run":\([0-9]*\).*/\1/p' "$STATE_DIR/state.json" 2>/dev/null)
+			[ -n "$_due" ] || _due=0
+			_retry=$(cat "$STATE_DIR/retry_at" 2>/dev/null)
+			if [ -n "$_retry" ] && [ "$_retry" -gt "$_due" ]; then
+				_due=$_retry
+			fi
+
+			if [ "$_now" -ge "$_due" ]; then
+				rm -f "$STATE_DIR/retry_at"
+				if ! run_once; then
+					mkdir -p "$STATE_DIR" 2>/dev/null
+					printf '%s' "$((_now + INTERVAL))" > "$STATE_DIR/retry_at" 2>/dev/null
+				fi
+			else
+				_left=$((_due - _now))
+				[ "$_left" -lt "$_wait" ] && _wait=$_left
+			fi
+
+			[ "$_STOP" = 1 ] && break
+		done
+
+		[ "$_STOP" = 1 ] && break
+		# 所有线路都停用：不再空转，进程退出；重新启用后 procd 会随配置变更自动拉起
+		if [ "$_any" = 0 ]; then
+			rm -rf "$_pidf" 2>/dev/null
+			exit 0
+		fi
+		if [ "$((_now - _last_sweep))" -ge 60 ]; then
+			sweep_hosts
+			_last_sweep=$_now
+		fi
+		[ "$_wait" -lt 1 ] && _wait=1
+		# sleep 放后台再 wait：收到 TERM 时 wait 立刻返回，能及时退出
+		sleep "$_wait" &
+		wait $!
+	done
+	rm -rf "$_pidf" 2>/dev/null
+	exit 0
+}
+
+# ---------------------------------------------------------------- 子命令
+
+cmd_status() {
+	load_conf
+	_busy=false
+	[ -d "$STATE_DIR/lock" ] && _busy=true
+	_enabled=false
+	cfg_bool enabled 1 && _enabled=true
+
+	printf '{"busy":%s,"enabled":%s,"now":%s,"state":' "$_busy" "$_enabled" "$(date +%s)"
+	if [ -f "$STATE_DIR/state.json" ]; then
+		cat "$STATE_DIR/state.json"
+	else
+		printf 'null'
+	fi
+	printf '}\n'
+}
+
+cmd_history() {
+	load_conf
+	_n=$(num "${1:-20}" 20)
+	_f="$STATE_DIR/history.jsonl"
+	if [ ! -s "$_f" ]; then
+		printf '[]\n'
+		return 0
+	fi
+	printf '['
+	tail -n "$_n" "$_f" | awk 'NR > 1 { printf "," } { printf "%s", $0 }'
+	printf ']\n'
+}
+
+cmd_show() {
+	load_conf
+	if [ ! -f "$STATE_DIR/rank.tsv" ]; then
+		echo "还没有运行过"
+		return 0
+	fi
+	printf '%-16s %-6s %8s %10s %14s %5s %7s\n' IP 落地 ping443 TLS握手ms 抖动范围 失败 分数
+	awk -F'\t' '{ printf "%-16s %-6s %8s %10s %14s %5s %7s\n", $5, $12, $14, $7, $15"-"$16, $11, $13 }' "$STATE_DIR/rank.tsv"
+	if [ -f "$STATE_DIR/state.json" ]; then
+		printf '\n状态: %s\n' "$(sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$STATE_DIR/state.json")"
+	fi
+}
+
+cmd_busy() {
+	load_conf
+	[ -d "$STATE_DIR/lock" ] || return 1
+	_pid=$(cat "$STATE_DIR/lock/pid" 2>/dev/null)
+	[ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && return 0
+	rm -rf "$STATE_DIR/lock"
+	return 1
+}
+
+cmd_log() {
+	load_conf
+	tail -n "$(num "${1:-30}" 30)" "$STATE_DIR/bestip.log" 2>/dev/null
+}
+
+cmd_setup() {
+	load_conf
+	uci_ok || { err "需要 uci（BESTIP_NO_UCI 已设置？）"; return 1; }
+	uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1 || { err "未找到 dnsmasq 配置"; return 1; }
+
+	mkdir -p "$(dirname "$HOSTS_FILE")" 2>/dev/null
+	if [ ! -f "$HOSTS_FILE" ]; then
+		if [ -n "$FALLBACK_IP" ]; then
+			printf '%s %s\n' "$FALLBACK_IP" "$HOSTNAME" > "$HOSTS_FILE"
+		else
+			: > "$HOSTS_FILE"
+		fi
+	fi
+
+	if [ "$HOSTS_FILE" != "/tmp/best.hosts" ]; then
+		uci -q del_list "dhcp.@dnsmasq[0].addnhosts=/tmp/best.hosts" 2>/dev/null && uci commit dhcp
+	fi
+
+	_cur=$(uci -q get dhcp.@dnsmasq[0].addnhosts)
+	if ! printf '%s\n' "$_cur" | tr ' ' '\n' | grep -qxF "$HOSTS_FILE"; then
+		uci add_list "dhcp.@dnsmasq[0].addnhosts=$HOSTS_FILE"
+		uci commit dhcp
+		log "已把 $HOSTS_FILE 加入 dnsmasq addnhosts"
+		# addn-hosts 是启动参数，新增后必须重启才生效
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	else
+		/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	fi
+	echo "ok"
+}
+
+cmd_unsetup() {
+	load_conf
+	uci_ok || return 1
+	uci -q del_list "dhcp.@dnsmasq[0].addnhosts=$HOSTS_FILE" 2>/dev/null
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	echo "ok"
+}
+
+main() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-s|--section) SECTION=${2:-}; shift 2 || shift ;;
+			*) break ;;
+		esac
+	done
+
+	_cmd=${1:-status}
+	[ $# -gt 0 ] && shift
+
+	case "$_cmd" in
+		run)
+			_force=0
+			for _a in "$@"; do
+				case "$_a" in
+					--force) _force=1 ;;
+					--loop)  run_loop; return 0 ;;
+				esac
+			done
+			load_conf
+			if [ "$_force" = 0 ] && ! cfg_bool enabled 1; then
+				log "未启用，跳过"
+				return 0
+			fi
+			run_once
+			;;
+		status)  cmd_status ;;
+		history) cmd_history "$@" ;;
+		show)    cmd_show ;;
+		log)     cmd_log "$@" ;;
+		busy)    cmd_busy ;;
+		setup)   cmd_setup ;;
+		unsetup) cmd_unsetup ;;
+		version) echo "bestip 1.0.0" ;;
+		*)
+			echo "用法: bestip [-s 线路] {run [--force] [--loop]|status|history [N]|show|log [N]|setup|unsetup}"
+			return 1
+			;;
+	esac
+}
+
+main "$@"

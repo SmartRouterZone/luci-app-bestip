@@ -1,0 +1,57 @@
+config bestip 'main'
+	option enabled '1'
+
+	# 两轮之间隔多久（秒）
+	option interval '600'
+
+	# 拨测目标（用 --resolve 直连 IP，SNI 仍是这个域名）
+	option target 'https://dash.cloudflare.com/favicon.ico'
+
+	# 结果写入：每行一个 IP，同名两条
+	option hostname 'best.host'
+	# 多条线路可共用一个文件，各自只替换自己 hostname 的行
+	option hosts_file '/tmp/bestip.host'
+	# 留空则用 /tmp/bestip/<解析域名>
+	# option state_dir '/tmp/bestip/best.host'
+
+	# 优选 IP 池（暂只支持 /24 或单个 IP）
+	list pool '172.64.229.0/24'
+	list pool '162.159.38.0/24'
+	list pool '162.159.39.0/24'
+
+	# 每轮抽几个新 IP；加上现任共 sample_new + 2 个候选
+	option sample_new '8'
+	option keep '2'
+
+	# 每个 IP 测几次、并发、超时
+	option rounds '5'
+	option concurrency '4'
+	option connect_timeout '3'
+	option max_time '5'
+
+	# 判决：失败几次淘汰、延迟上限、波动上限（ping:443 最慢一次 / 中位数，200 = 2 倍）
+	option max_fails '1'
+	option max_latency_ms '2000'
+	option spread_max_pct '200'
+
+	# 整轮噪声保护：过半候选同时判为不稳时跳过本轮判决，不消耗确认轮数
+	option noise_guard '1'
+
+	# 切换：领先多少百分比、连续几轮才生效
+	option switch_margin '15'
+	option confirm_rounds '2'
+
+	# 2 个 IP 尽量来自不同 /24
+	option prefer_distinct_pool '1'
+
+	# 为了分散而选另一条线时，延迟最多允许是最优的几倍（150 = 1.5 倍）
+	option distinct_factor '150'
+
+	# 写完后是否 HUP dnsmasq
+	option dnsmasq_reload '0'
+
+	# 可选：绑 WAN 网卡，多出口/VPN 时用
+	option interface ''
+
+	# 可选：首次启动、还没探测结果时先给一个兜底地址
+	option fallback_ip ''
