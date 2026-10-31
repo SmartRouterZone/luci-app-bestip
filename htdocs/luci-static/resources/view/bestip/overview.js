@@ -44,9 +44,20 @@ function row(title, value) {
 function statusSection(data, line) {
 	var st = data.state || {};
 	var cur = st.current || [];
+	var enabled = data.enabled !== false;
+	var overdue = enabled && st.next_run > 0 && st.next_run * 1000 < Date.now() - 120000;
 	var busy = data.busy ? E('em', {}, [ _('拨测中…') ]) : '';
+	var hint = [];
+	if (!enabled)
+		hint.push(_('已停止拨测，当前解析保持不变'));
+	if (overdue)
+		hint.push(_('调度未运行：上次排期已过，服务可能没在跑'));
 
 	return [
+		row(_('状态'), E('span', {}, [
+			enabled ? E('strong', {}, [ _('启用') ]) : E('strong', {}, [ _('已停用') ]),
+			hint.length ? E('em', {}, [ ' ' + hint.join('；') ]) : ''
+		])),
 		row(_('解析'), E('span', {}, [
 			E('strong', {}, [ st.hostname || 'best.host' ]),
 			' → ',
@@ -56,7 +67,7 @@ function statusSection(data, line) {
 		])),
 		row(_('本轮结论'), E('span', {}, [ st.reason || '—' ])),
 		row(_('上次更新'), E('span', {}, [ clock(st.ts) ])),
-		row(_('下次拨测'), E('span', {}, [ clock(st.next_run) ])),
+		row(_('下次拨测'), E('span', {}, [ enabled ? clock(st.next_run) : E('em', {}, [ _('—') ]) ])),
 		row(_('拨测目标'), E('code', {}, [ st.target || '—' ])),
 		row(_('操作'), E('div', {}, [
 			E('button', {

@@ -1,6 +1,6 @@
 {
 	"admin/services/bestip": {
-		"title": "优选 IP",
+		"title": "Best IP",
 		"order": 30,
 		"action": {
 			"type": "firstchild"

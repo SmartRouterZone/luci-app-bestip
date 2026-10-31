@@ -29,16 +29,16 @@ SECTION=${BESTIP_SECTION:-}
 TAB=$(printf '\t')
 
 err()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
-# 不同固件的 syslog 落点不一样，所以同时写一份到 tmpfs
+# 只写 tmpfs 里的一份，不再刷系统日志（LuCI 的日志页读的就是这份）
 log() {
 	_dir=${STATE_DIR:-/tmp/bestip}
 	mkdir -p "$_dir" 2>/dev/null
 	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$_dir/bestip.log" 2>/dev/null
-	logger -t "$PROG[${SECTION:-main}]" "$*" 2>/dev/null || true
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 num()  { case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
-rnd()  { od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n'; }
+# 种子取自 /dev/urandom（需要 coreutils-od，busybox 不一定带 od）
+rnd() { od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n'; }
 pad6() { printf '%06d' "$(num "$1" 0)" 2>/dev/null || printf '000000'; }
 iso()  { date +%Y-%m-%dT%H:%M:%S%z; }
 uci_ok() { [ -z "${BESTIP_NO_UCI:-}" ] && have uci; }
@@ -153,7 +153,15 @@ target_host() {
 }
 
 shuffle() {
-	awk -v s="$(rnd)" 'BEGIN { srand(s) } { print rand(), $0 }' | sort -n | cut -d' ' -f2-
+	# 种子 = urandom + 池名哈希；池名加盐是为了 od 取不到时，多个池也不会抽出同一批尾号
+	awk -v s="$(rnd)" -v salt="${1:-}" '
+		BEGIN {
+			h = 0
+			for (i = 1; i <= length(salt); i++)
+				h = (h * 31 + index("0123456789./", substr(salt, i, 1))) % 65536
+			srand(s + h)
+		}
+		{ print rand(), $0 }' | sort -n | cut -d' ' -f2-
 }
 
 pick_from_pool() {
@@ -163,7 +171,7 @@ pick_from_pool() {
 		*/*)
 			_net=${_p%/*}
 			_pre=${_net%.*}
-			seq 1 254 2>/dev/null | shuffle | head -n "$_q" | sed "s#^#$_pre.#"
+			seq 1 254 2>/dev/null | shuffle "$_p" | head -n "$_q" | sed "s#^#$_pre.#"
 			;;
 		*)
 			[ "$_q" -ge 1 ] && printf '%s\n' "$_p"
@@ -206,6 +214,25 @@ sample_ips() {
 current_ips() {
 	[ -f "$HOSTS_FILE" ] || return 0
 	awk -v h="$HOSTNAME" '$2 == h { print $1 }' "$HOSTS_FILE" | tr -d '\r' | sort -u
+}
+
+# 删掉已不存在的线路在 hosts 文件里留下的行（线路被删除时没人再重写它）
+sweep_hosts() {
+	_live=" " _files=" "
+	for _s in $(all_sections); do
+		SECTION=$_s
+		_h=$(cfg_get hostname '')
+		_f=$(cfg_get hosts_file '/tmp/bestip.host')
+		[ -n "$_h" ] && _live="$_live$_h "
+		case "$_files" in *" $_f "*) ;; *) _files="$_files$_f " ;; esac
+	done
+	for _f in $_files; do
+		[ -f "$_f" ] || continue
+		awk -v live="$_live" '
+			BEGIN { n = split(live, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+			$2 in ok { print }
+		' "$_f" > "$_f.sweep" && mv "$_f.sweep" "$_f"
+	done
 }
 
 # ---------------------------------------------------------------- 拨测
@@ -684,6 +711,28 @@ run_loop() {
 	_STOP=0
 	trap '_STOP=1' TERM INT
 
+	# 单实例：procd 的重启重试会同时拉起多个，用目录锁抢占，后启动的直接退出
+	_pidf=/tmp/bestip/loop.lock
+	mkdir -p /tmp/bestip 2>/dev/null
+	_try=0
+	while :; do
+		if mkdir "$_pidf" 2>/dev/null; then
+			printf '%s' "$$" > "$_pidf/pid"
+			break
+		fi
+		_old=$(cat "$_pidf/pid" 2>/dev/null)
+		if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null; then
+			_cmd=$(tr '\0' ' ' < "/proc/$_old/cmdline" 2>/dev/null)
+			case "$_cmd" in
+				*bestip*) exit 0 ;;
+			esac
+		fi
+		# 抢到锁的实例还没来得及写 pid：等 1 秒再看，连续 3 次判定为残留
+		_try=$((_try + 1))
+		[ "$_try" -ge 3 ] && rm -rf "$_pidf"
+		sleep 1
+	done
+
 	# 手动指定线路时只跑这一条（调试用）
 	if [ -n "$SECTION" ]; then
 		load_conf
@@ -691,20 +740,33 @@ run_loop() {
 			load_conf
 			cfg_bool enabled 1 && run_once
 			[ "$_STOP" = 1 ] && break
-			sleep "$INTERVAL"
+			# sleep 放后台再 wait：收到 TERM 时 wait 立刻返回，能及时退出
+			sleep "$INTERVAL" &
+			wait $!
 		done
+		rm -rf "$_pidf" 2>/dev/null
 		exit 0
 	fi
 
 	# 否则每轮扫一遍配置里现有的线路：新增、删除线路都不用重启服务
+	_last_sweep=0
 	while [ "$_STOP" = 0 ]; do
 		_now=$(date +%s)
 		_wait=15
+		_any=0
 
 		for _sec in $(all_sections); do
 			SECTION=$_sec
 			load_conf
-			cfg_bool enabled 1 || continue
+			if ! cfg_bool enabled 1; then
+				# 停用的线路：清掉运行时状态（历史、日志、排期），hosts 里的解析保留
+				case "$STATE_DIR" in
+					""|/|/tmp|/tmp/bestip) : ;;
+					*) [ -d "$STATE_DIR" ] && rm -rf "$STATE_DIR" ;;
+				esac
+				continue
+			fi
+			_any=1
 
 			_due=$(sed -n 's/.*"next_run":\([0-9]*\).*/\1/p' "$STATE_DIR/state.json" 2>/dev/null)
 			[ -n "$_due" ] || _due=0
@@ -728,9 +790,21 @@ run_loop() {
 		done
 
 		[ "$_STOP" = 1 ] && break
+		# 所有线路都停用：不再空转，进程退出；重新启用后 procd 会随配置变更自动拉起
+		if [ "$_any" = 0 ]; then
+			rm -rf "$_pidf" 2>/dev/null
+			exit 0
+		fi
+		if [ "$((_now - _last_sweep))" -ge 60 ]; then
+			sweep_hosts
+			_last_sweep=$_now
+		fi
 		[ "$_wait" -lt 1 ] && _wait=1
-		sleep "$_wait"
+		# sleep 放后台再 wait：收到 TERM 时 wait 立刻返回，能及时退出
+		sleep "$_wait" &
+		wait $!
 	done
+	rm -rf "$_pidf" 2>/dev/null
 	exit 0
 }
 

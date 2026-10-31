@@ -52,7 +52,7 @@ function addLine(m) {
 
 				uci.add('bestip', 'bestip', name);
 				uci.set('bestip', name, 'hostname', host);
-				uci.set('bestip', name, 'enabled', '0');
+				uci.set('bestip', name, 'enabled', '1');
 
 				return uci.save().then(function() {
 					ui.changes.init();
@@ -198,7 +198,7 @@ return view.extend({
 	},
 
 	render: function() {
-		var m = new form.Map('bestip', _('优选 IP'),
+		var m = new form.Map('bestip', _('Best IP'),
 			_('每轮抽若干 IP 拨测，与现任比较后再决定是否切换。保存后下一轮生效，不需要重启服务。'));
 		var o;
 
@@ -209,8 +209,9 @@ return view.extend({
 		s.description = _('每条线路一个标签，点标签分别设置；标签右边的 + 可以新增线路');
 
 		o = s.option(form.Flag, 'enabled', _('启用'));
-		o.default = '0';
-		o.description = _('关闭后停止拨测，当前解析保持不变');
+		o.default = '1';
+		o.rmempty = false;
+		o.description = _('停用后停止拨测，当前解析保持不变');
 
 		o = s.option(form.Value, 'hostname', _('解析域名'));
 		o.description = _('写进 hosts 的名字，例如 nrt.best.host；每条线路一个');

@@ -16,3 +16,12 @@ start_service() {
 service_triggers() {
 	procd_add_reload_trigger "bestip"
 }
+
+reload() {
+	# 引擎每轮都会重读配置：运行中不用重启，免得打断正在进行的拨测；
+	# 没在跑（例如全部线路停用后进程已退出）才拉起来
+	if [ -f /tmp/bestip/loop.lock/pid ] && kill -0 "$(cat /tmp/bestip/loop.lock/pid 2>/dev/null)" 2>/dev/null; then
+		return 0
+	fi
+	start
+}

@@ -1,16 +1,10 @@
 # luci-app-bestip
 
-OpenWrt 上的「Cloudflare 优选 IP」小工具：定时从 IP 池里抽样拨测，把**最快且稳定**的 2 个写进一个 hosts 文件（默认 `/tmp/bestip.host`），并带一个 LuCI 看板。
+OpenWrt 上的「Cloudflare Best IP」小工具：定时从 IP 池里抽样拨测，把**最快且稳定**的 2 个写进一个 hosts 文件（默认 `/tmp/bestip.host`），并带一个 LuCI 看板。
 
 默认参数就是按「每次 10 个候选、留最优 2 个、10 分钟一轮、写入 `best.host`」配好的。
 
 > 本分支适配 **OpenWrt 24.10.x**（opkg / `.ipk`）。25.12 及以上用 `25.12` 分支（apk / `.apk`）。
-
-## 截图
-
-![概览](docs/overview.png)
-
-![设置](docs/settings.png)
 
 ## 一轮发生了什么
 
@@ -79,7 +73,7 @@ make package/luci-app-bestip/compile V=s
 
 ```sh
 opkg update
-opkg install curl ca-bundle
+opkg install curl ca-bundle coreutils-od
 opkg install luci-app-bestip_*.ipk   # postinst 会自动 reload rpcd
 /etc/init.d/bestip enable
 /etc/init.d/bestip start
@@ -95,16 +89,16 @@ opkg install luci-app-bestip_*.ipk   # postinst 会自动 reload rpcd
 
 - 用到的 LuCI 接口：`form.Map` / `TypedSection` / `Value` / `DynamicList` / `Flag` / `Button`、`dom.parse`、`dom.content`、`poll.add`、`ui.addNotification`、`rpc.declare`、`view.extend` —— 24.10 的 `modules/luci-base` 里这些都在。
 - 直接铺文件的方式（方式 A）两个版本完全一样，跟包管理器无关。
-- 引擎只依赖 BusyBox 自带工具：`awk`、`sort`、`od`、`seq`、`tr`、`sed`，外加 `curl`。
-- 安装依赖：24.10 用 `opkg install curl ca-bundle`，25.12 用 `apk add curl ca-bundle`。`luci-base` 已写进 `LUCI_DEPENDS`。
+- 引擎用到：`awk`、`sort`、`seq`、`tr`、`sed`（BusyBox 自带）、`curl`，以及 `od`（BusyBox 不一定带，需要装 `coreutils-od`）。
+- 安装依赖：24.10 用 `opkg install curl ca-bundle coreutils-od`，25.12 用 `apk add curl ca-bundle coreutils-od`。`luci-base`、`coreutils-od` 已写进 `LUCI_DEPENDS`。
 
 ### 依赖
 
-`curl`（要支持 `--resolve`，OpenWrt 包里的都支持）、`ca-bundle`。BusyBox 的 `wget` 干不了这事。
+`curl`（要支持 `--resolve`，OpenWrt 包里的都支持）、`ca-bundle`、`coreutils-od`（抽样用的随机种子读 `/dev/urandom`，BusyBox 的 `od` 不保证编进固件）。BusyBox 的 `wget` 干不了这事。
 
 ## 配置
 
-LuCI → 服务 → 优选 IP → 设置，或者直接改 `/etc/config/bestip`。**保存后下一轮生效，不用重启服务。**
+LuCI → 服务 → Best IP → 设置，或者直接改 `/etc/config/bestip`。**保存后下一轮生效，不用重启服务。**
 
 需要多个域名时再加一个 `config bestip '<名字>'` 段即可（一段 = 一条线路，数量不限）：hosts 文件共用，各自只替换自己 hostname 的行；状态目录默认按域名分开，互不干扰。
 
